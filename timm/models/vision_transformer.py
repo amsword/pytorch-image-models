@@ -272,7 +272,8 @@ class VisionTransformer(nn.Module):
     """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, num_classes=1000, embed_dim=768, depth=12,
                  num_heads=12, mlp_ratio=4., qkv_bias=True, qk_scale=None, representation_size=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., hybrid_backbone=None, norm_layer=None):
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 hybrid_backbone=None, norm_layer=None, **kwargs):
         """
         Args:
             img_size (int, tuple): input image size
@@ -293,6 +294,7 @@ class VisionTransformer(nn.Module):
             norm_layer: (nn.Module): normalization layer
         """
         super().__init__()
+        self.output_grid = kwargs.get('output_grid', False)
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
@@ -366,12 +368,18 @@ class VisionTransformer(nn.Module):
         for blk in self.blocks:
             x = blk(x)
 
-        x = self.norm(x)[:, 0]
+        #x = self.norm(x)[:, 0]
+        x = self.norm(x)
+        if self.output_grid:
+            return x
+        x = x[:, 0]
         x = self.pre_logits(x)
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
+        if self.output_grid:
+            return x
         x = self.head(x)
         return x
 
@@ -410,9 +418,13 @@ class DistilledVisionTransformer(VisionTransformer):
             x = blk(x)
 
         x = self.norm(x)
+        if self.output_grid:
+            return x
         return x[:, 0], x[:, 1]
 
     def forward(self, x):
+        if self.output_grid:
+            return self.forward_features(x)
         x, x_dist = self.forward_features(x)
         x = self.head(x)
         x_dist = self.head_dist(x_dist)
@@ -482,7 +494,8 @@ def _create_vision_transformer(variant, pretrained=False, distilled=False, **kwa
     if pretrained:
         load_pretrained(
             model, num_classes=num_classes, in_chans=kwargs.get('in_chans', 3),
-            filter_fn=partial(checkpoint_filter_fn, model=model))
+            filter_fn=partial(checkpoint_filter_fn, model=model),
+            model_dir=kwargs.get('model_dir'))
     return model
 
 

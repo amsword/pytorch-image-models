@@ -30,6 +30,7 @@ def load_state_dict(checkpoint_path, use_ema=False):
         state_dict_key = 'state_dict'
         if isinstance(checkpoint, dict):
             if use_ema and 'state_dict_ema' in checkpoint:
+                _logger.info('Use state_dict_ema')
                 state_dict_key = 'state_dict_ema'
         if state_dict_key and state_dict_key in checkpoint:
             new_state_dict = OrderedDict()
@@ -148,14 +149,17 @@ def load_custom_pretrained(model, cfg=None, load_fn=None, progress=False, check_
         _logger.warning("Valid function to load pretrained weights is not available, using random initialization.")
 
 
-def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3, filter_fn=None, strict=True, progress=False):
+def load_pretrained(model, cfg=None, num_classes=1000, in_chans=3,
+        filter_fn=None, strict=True, progress=False, model_dir=None):
     if cfg is None:
         cfg = getattr(model, 'default_cfg')
     if cfg is None or 'url' not in cfg or not cfg['url']:
         _logger.warning("Pretrained model URL does not exist, using random initialization.")
         return
 
-    state_dict = load_state_dict_from_url(cfg['url'], progress=progress, map_location='cpu')
+    state_dict = load_state_dict_from_url(cfg['url'], progress=progress,
+            map_location='cpu', model_dir=model_dir)
+    _logger.info(f'Load pretrained from {model_dir}')
     if filter_fn is not None:
         state_dict = filter_fn(state_dict)
 

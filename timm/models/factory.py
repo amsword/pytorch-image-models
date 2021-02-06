@@ -55,6 +55,7 @@ def create_model(
             raise RuntimeError('Unknown model (%s)' % model_name)
 
     if checkpoint_path:
-        load_checkpoint(model, checkpoint_path)
+        load_checkpoint(model, checkpoint_path,
+                use_ema=kwargs.get('use_ema', False))
 
     return model
