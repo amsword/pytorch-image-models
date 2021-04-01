@@ -165,12 +165,15 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        # this is the same as bert-style mask
+        if attention_mask is not None:
+            attn = attn + attention_mask
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -194,8 +197,8 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+    def forward(self, x, attention_mask=None):
+        x = x + self.drop_path(self.attn(self.norm1(x), attention_mask))
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
@@ -207,7 +210,9 @@ class PatchEmbed(nn.Module):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
+        self.out_h = img_size[0] // patch_size[0]
+        self.out_w = img_size[1] // patch_size[1]
+        num_patches = self.out_w * self.out_h
         self.img_size = img_size
         self.patch_size = patch_size
         self.num_patches = num_patches
@@ -221,7 +226,6 @@ class PatchEmbed(nn.Module):
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
-
 
 class HybridEmbed(nn.Module):
     """ CNN Feature Map Embedding
@@ -358,11 +362,19 @@ class VisionTransformer(nn.Module):
 
     def forward_features(self, x):
         B = x.shape[0]
+        H, W = x.shape[2:]
         x = self.patch_embed(x)
+        pos_embed = self.pos_embed
+        if H != self.patch_embed.img_size[0] or W != self.patch_embed.img_size[1]:
+            assert ValueError('not expected')
+            pos_embed = pos_embed[0, 1:, :].reshape((self.patch_embed.out_h, self.patch_embed.out_w, self.embed_dim))
+            new_size = (H // self.patch_embed.patch_size[0], W // self.patch_embed.patch_size[1], self.embed_dim)
+            pos_embed = torch.nn.functional.interpolate(pos_embed, size=new_size, mode='bilinear')
+            pos_embed = torch.cat((self.pos_embed[0, 0:1, :], pos_embed), dim=1)
 
         cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
         x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
+        x = x + pos_embed
         x = self.pos_drop(x)
 
         for blk in self.blocks:
