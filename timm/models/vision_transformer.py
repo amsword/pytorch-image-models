@@ -152,6 +152,60 @@ class Mlp(nn.Module):
         return x
 
 
+class IPAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0., qk_not_share=False):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        head_share_phi = True
+        if head_share_phi:
+            if qk_not_share:
+                self.phi_q = nn.Sequential(
+                    nn.Linear(head_dim, head_dim),
+                    nn.ReLU(),
+                )
+                self.phi_k = nn.Sequential(
+                    nn.Linear(head_dim, head_dim),
+                    nn.ReLU(),
+                )
+            else:
+                phi = nn.Sequential(
+                    nn.Linear(head_dim, head_dim),
+                    nn.ReLU(),
+                )
+                self.phi_q = phi
+                self.phi_k = phi
+        else:
+            assert NotImplementedError
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, attention_mask=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+
+        phi_q = self.phi_q(q)
+        phi_k = self.phi_k(k)
+        attn = phi_q @ phi_k.transpose(-2, -1)
+        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1.e-5)
+        if attention_mask is not None:
+            assert ((attention_mask == 0) & (attention_mask == 1)).sum() == attention_mask.numel()
+            attn = attn * attention_mask
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
         super().__init__()
