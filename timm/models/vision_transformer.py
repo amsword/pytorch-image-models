@@ -154,7 +154,8 @@ class Mlp(nn.Module):
 
 class IPAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
-                 attn_drop=0., proj_drop=0., qk_not_share=False):
+                 attn_drop=0., proj_drop=0., qk_not_share=False,
+                 qk_norm=None):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -185,6 +186,7 @@ class IPAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+        self.qk_norm = qk_norm
 
     def forward(self, x, attention_mask=None):
         B, N, C = x.shape
@@ -194,7 +196,12 @@ class IPAttention(nn.Module):
         phi_q = self.phi_q(q)
         phi_k = self.phi_k(k)
         attn = phi_q @ phi_k.transpose(-2, -1)
-        attn = attn / (attn.sum(dim=-1, keepdim=True) + 1.e-5)
+        if self.qk_norm is None:
+            attn = attn / (attn.sum(dim=-1, keepdim=True) + 1.e-5)
+        elif self.qk_norm == 'N':
+            attn = attn / attn.shape[-1]
+        else:
+            raise NotImplementedError(self.qk_norm)
         if attention_mask is not None:
             assert ((attention_mask == 0) & (attention_mask == 1)).sum() == attention_mask.numel()
             attn = attn * attention_mask
