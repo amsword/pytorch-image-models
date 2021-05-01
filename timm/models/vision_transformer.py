@@ -328,6 +328,24 @@ class HybridEmbed(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
 
+class TokenSample(nn.Module):
+    def __init__(self, num, method=None):
+        super().__init__()
+        self.num = num
+        self.method = method
+
+    def forward(self, x):
+        B, N = x.shape[:2]
+        if N <= self.num:
+            return x
+        if self.method is None:
+            # by default, we always include the first one, which is [CLS] token
+            zero = torch.zeros((1,), dtype=torch.int64)
+            ys = [x[b][torch.cat((zero, torch.randperm(N - 1)[:(self.num-1)] + 1))] for b in range(B)]
+            x = torch.stack(ys)
+        else:
+            raise NotImplementedError
+        return x
 
 class VisionTransformer(nn.Module):
     """ Vision Transformer
