@@ -187,6 +187,7 @@ class IPAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.qk_norm = qk_norm
+        self.iter = 0
 
     def forward(self, x, attention_mask=None):
         B, N, C = x.shape
@@ -203,8 +204,12 @@ class IPAttention(nn.Module):
         else:
             raise NotImplementedError(self.qk_norm)
         if attention_mask is not None:
-            assert ((attention_mask == 0) & (attention_mask == 1)).sum() == attention_mask.numel()
+            assert ((attention_mask == 0) | (attention_mask == 1)).sum() == attention_mask.numel()
             attn = attn * attention_mask
+        if (self.iter % 500) == 0:
+            from qd.torch_common import describe_tensor
+            logging.info(describe_tensor(attn))
+        self.iter += 1
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
@@ -214,7 +219,8 @@ class IPAttention(nn.Module):
         return x
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -239,6 +245,7 @@ class Attention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -414,6 +421,12 @@ class VisionTransformer(nn.Module):
 
         # Classifier head
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.sample_token = kwargs.get('sample_token')
+        self.sample_style = kwargs.get('sample_style')
+        assert self.sample_style in [None, 'vilt']
+        if self.sample_token is not None:
+            from qd.layers.token_sample import TokenSample
+            self.sample_module = TokenSample(self.sample_token)
 
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
@@ -439,22 +452,163 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
+    def visual_embed(self, _x, max_image_len=200, mask_it=False):
+        _x = _x.to(self.patch_embed.proj.weight.dtype)
+        _, _, ph, pw = self.patch_embed.proj.weight.shape
+
+        x = self.patch_embed.proj(_x)
+        x_mask = (_x.sum(dim=1) != 0).float()[:, None, :, :]
+        x_mask = F.interpolate(x_mask, size=(x.shape[2], x.shape[3])).long()
+        # in the official released code, it is to cherry-pick the value from
+        # teh first one. but it may be more robust to use the max value as the
+        # heigh/width
+        #x_h = x_mask[:, 0].sum(dim=1)[:, 0]
+        #x_w = x_mask[:, 0].sum(dim=2)[:, 0]
+        x_h, _ = x_mask[:, 0].sum(dim=1).max(dim=1)
+        x_w, _ = x_mask[:, 0].sum(dim=2).max(dim=1)
+        x_h[x_h == 0] = 1
+        x_w[x_w == 0] = 1
+
+        B, C, H, W = x.shape
+        spatial_pos = (
+            self.pos_embed[:, 1:, :]
+            .transpose(1, 2)
+            .view(1, C, self.patch_dim, self.patch_dim)
+        )
+        pos_embed = torch.cat(
+            [
+                F.pad(
+                    F.interpolate(
+                        spatial_pos, size=(h, w), mode="bilinear", align_corners=True,
+                    ),
+                    (0, W - w, 0, H - h),
+                )
+                for h, w in zip(x_h, x_w)
+            ],
+            dim=0,
+        )
+
+        pos_embed = pos_embed.flatten(2).transpose(1, 2)
+        x = x.flatten(2).transpose(1, 2)
+        patch_index = (
+            torch.stack(
+                torch.meshgrid(
+                    torch.arange(x_mask.shape[-2]), torch.arange(x_mask.shape[-1])
+                ),
+                dim=-1,
+            )[None, None, :, :, :]
+            .expand(x_mask.shape[0], x_mask.shape[1], -1, -1, -1)
+            .flatten(1, 3)
+        )
+        x_mask = x_mask.flatten(1)
+
+        if mask_it:
+            x, label = self.mask_tokens(_x, x)
+
+        if (
+            max_image_len < 0
+            or max_image_len is None
+            or not isinstance(max_image_len, int)
+        ):
+            # suppose aug is 800 x 1333, then, maximum effective res is 800 x 1333 (if one side gets bigger, the other will be constrained and be shrinked)
+            # (800 // self.patch_size) * (1333 // self.patch_size) is the maximum number of patches that single image can get.
+            # if self.patch_size = 32, 25 * 41 = 1025
+            # if res is 384 x 640, 12 * 20 = 240
+            eff = x_h * x_w
+            max_image_len = eff.max()
+        else:
+            eff = x_h * x_w
+            max_image_len = min(eff.max(), max_image_len)
+
+        valid_idx = x_mask.nonzero(as_tuple=False)
+        non_valid_idx = (1 - x_mask).nonzero(as_tuple=False)
+        unique_rows = valid_idx[:, 0].unique()
+        valid_row_idx = [valid_idx[valid_idx[:, 0] == u] for u in unique_rows]
+        non_valid_row_idx = [
+            non_valid_idx[non_valid_idx[:, 0] == u] for u in unique_rows
+        ]
+
+        valid_nums = [v.size(0) for v in valid_row_idx]
+        non_valid_nums = [v.size(0) for v in non_valid_row_idx]
+        pad_nums = [max_image_len - v for v in valid_nums]
+
+        select = list()
+        for i, (v, nv, p) in enumerate(zip(valid_nums, non_valid_nums, pad_nums)):
+            if p <= 0:
+                valid_choice = torch.multinomial(torch.ones(v).float(), max_image_len)
+                select.append(valid_row_idx[i][valid_choice])
+            else:
+                pad_choice = torch.multinomial(
+                    torch.ones(nv).float(), p, replacement=True
+                )
+                select.append(
+                    torch.cat(
+                        [valid_row_idx[i], non_valid_row_idx[i][pad_choice]], dim=0,
+                    )
+                )
+
+        select = torch.cat(select, dim=0)
+        x = x[select[:, 0], select[:, 1]].view(B, -1, C)
+        x_mask = x_mask[select[:, 0], select[:, 1]].view(B, -1)
+        patch_index = patch_index[select[:, 0], select[:, 1]].view(B, -1, 2)
+        pos_embed = pos_embed[select[:, 0], select[:, 1]].view(B, -1, C)
+
+        if mask_it:
+            label = label[select[:, 0], select[:, 1]].view(B, -1, 3)
+
+            label[x_mask == 0] = -100
+            label = torch.cat(
+                [torch.full((label.shape[0], 1, 3), -100).to(label), label,], dim=1,
+            )
+
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        pos_embed = torch.cat(
+            (self.pos_embed[:, 0, :][:, None, :].expand(B, -1, -1), pos_embed), dim=1
+        )
+        x = x + pos_embed
+        x = self.pos_drop(x)
+
+        # released code sets it as False; we will also not add it
+        #if self.add_norm_before_transformer:
+            #x = self.pre_norm(x)
+
+        x_mask = torch.cat([torch.ones(x_mask.shape[0], 1).to(x_mask), x_mask], dim=1)
+
+        if mask_it:
+            return x, x_mask, (patch_index, (H, W)), label
+        else:
+            return x, x_mask, (patch_index, (H, W)), None
+
+    def rect_patch_embed(self, x):
         B = x.shape[0]
         H, W = x.shape[2:]
         x = self.patch_embed(x)
         pos_embed = self.pos_embed
         if H != self.patch_embed.img_size[0] or W != self.patch_embed.img_size[1]:
-            assert ValueError('not expected')
             pos_embed = pos_embed[0, 1:, :].reshape((self.patch_embed.out_h, self.patch_embed.out_w, self.embed_dim))
-            new_size = (H // self.patch_embed.patch_size[0], W // self.patch_embed.patch_size[1], self.embed_dim)
-            pos_embed = torch.nn.functional.interpolate(pos_embed, size=new_size, mode='bilinear')
-            pos_embed = torch.cat((self.pos_embed[0, 0:1, :], pos_embed), dim=1)
+            new_size = (H // self.patch_embed.patch_size[0], W // self.patch_embed.patch_size[1])
+            pos_embed = torch.nn.functional.interpolate(pos_embed.permute((2, 0, 1)).unsqueeze(0), size=new_size, mode='bicubic')
+            pos_embed = pos_embed.squeeze(0).permute((1, 2, 0)).reshape((-1, self.embed_dim))
+            pos_embed = torch.cat((self.pos_embed[0, 0:1, :], pos_embed), dim=0).unsqueeze(0)
 
         cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + pos_embed
+        if self.sample_token is not None:
+            assert self.training
+            x = self.sample_module(x)
         x = self.pos_drop(x)
+        return x
+
+    def forward_features(self, x):
+        if self.sample_style is None:
+            x = self.rect_patch_embed(x)
+        else:
+            assert self.sample_style == 'vilt'
+            x, x_mask, patch_index, label = self.visual_embed(
+                x, max_image_len=self.sample_token, mask_it=False,
+            )
 
         for blk in self.blocks:
             x = blk(x)
@@ -473,7 +627,6 @@ class VisionTransformer(nn.Module):
             return x
         x = self.head(x)
         return x
-
 
 class DistilledVisionTransformer(VisionTransformer):
     """ Vision Transformer with distillation token.
