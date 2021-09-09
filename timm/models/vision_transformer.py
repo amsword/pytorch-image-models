@@ -79,6 +79,9 @@ default_cfgs = {
     'vit_large_patch32_384': _cfg(
         url='https://github.com/rwightman/pytorch-image-models/releases/download/v0.1-vitjx/jx_vit_large_p32_384-9b920ba8.pth',
         input_size=(3, 384, 384), mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), crop_pct=1.0),
+    'vit_huge_patch32_384': _cfg(
+        url='',
+        input_size=(3, 384, 384), mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5), crop_pct=1.0),
 
     # patch models, imagenet21k (weights ported from official Google JAX impl)
     'vit_base_patch16_224_in21k': _cfg(
@@ -152,11 +155,113 @@ class Mlp(nn.Module):
         return x
 
 
+class HAttention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
+                 attn_drop=0., proj_drop=0., group_size=None):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.qkv1 = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv2 = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.group_size = group_size
+        self.group_region = group_size * group_size
+
+    def attn(self, x, qkv):
+        B, N, C = x.shape
+        qkv = qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        #In : qkv.shape
+        #torch.Size([3, 2, 12, 10, 64])
+        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        #In : q.shape
+        #torch.Size([2, 12, 10, 64])
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        #In : attn.shape
+        #torch.Size([2, 12, 10, 10])
+
+        x = (attn @ v).transpose(1, 2).reshape(B, -1, C)
+        return x
+
+    def forward(self, x, attention_mask=None):
+        #In : x.shape
+        #torch.Size([2, 145, 768])
+        B, N, C = x.shape
+
+        x1 = x[:, 1:,:].reshape((B, -1, self.group_region, C))
+        #In : x1.shape
+        #torch.Size([2, 9, 16, 768])
+        x2 = x1.mean(dim=2)
+        #In : x2.shape
+        #torch.Size([2, 9, 768])
+
+        # global token with intermediate tokens
+        y = torch.cat((x[:, 0:1], x2), dim=1)
+
+        #In : y.shape
+        #torch.Size([2, 10, 768])
+        y = self.attn(y, self.qkv1)
+
+        #In : y.shape
+        #torch.Size([2, 10, 768])
+        cls = y[:, 0:1]
+        #In : cls.shape
+        #torch.Size([2, 1, 768])
+        y = y[:, 1:]
+        #In : y.shape
+        #torch.Size([2, 9, 768])
+        z = torch.cat((y.unsqueeze(dim=2), x1), dim=2)
+        B, num_group, group_region_plus, C = z.shape
+        z = z.reshape((-1, group_region_plus, C))
+        #In : z.shape
+        #torch.Size([18, 17, 768])
+        z = self.attn(z, self.qkv2)
+        z = z.reshape((B, num_group, group_region_plus, C))
+        x = torch.cat((cls, z[:, :, 1:].reshape((B, -1, C))), dim=1)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class ELUPlus(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        if n is None:
+            n = 1
+        self.n = n
+        assert n > 0
+
+    def __repr__(self):
+        tmpstr = self.__class__.__name__ + "("
+        tmpstr += "n=" + str(self.n)
+        tmpstr += ")"
+        return tmpstr
+
+    def forward(self, x):
+        y = torch.nn.functional.elu(x) + 1
+        if self.n != 1:
+            y = torch.pow(y, self.n)
+        return y
+
 class IPAttention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None,
                  attn_drop=0., proj_drop=0., qk_not_share=False,
-                 qk_norm=None):
+                 qk_norm=None,
+                 non_linear=None,
+                 init_to_sim=None,
+                 no_extra_linear=None,
+                 elu_plus_n=1,
+                 ):
         super().__init__()
+        from qd.qd_common import print_frame_info
+        print_frame_info()
         self.num_heads = num_heads
         head_dim = dim // num_heads
         # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
@@ -164,23 +269,48 @@ class IPAttention(nn.Module):
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         head_share_phi = True
+        def get_non_linear():
+            if non_linear is None:
+                return nn.ReLU()
+            elif non_linear == 'elu_plus':
+                return ELUPlus(elu_plus_n)
+            else:
+                raise NotImplementedError(non_linear)
         if head_share_phi:
             if qk_not_share:
-                self.phi_q = nn.Sequential(
-                    nn.Linear(head_dim, head_dim),
-                    nn.ReLU(),
-                )
-                self.phi_k = nn.Sequential(
-                    nn.Linear(head_dim, head_dim),
-                    nn.ReLU(),
-                )
+                ms = []
+                if not no_extra_linear:
+                    ms.append(nn.Linear(head_dim, head_dim))
+                ms.append(get_non_linear())
+                self.phi_q = nn.Sequential(*ms)
+
+                ms = []
+                if not no_extra_linear:
+                    ms.append(nn.Linear(head_dim, head_dim))
+                ms.append(get_non_linear())
+                self.phi_k = nn.Sequential(*ms)
             else:
-                phi = nn.Sequential(
-                    nn.Linear(head_dim, head_dim),
-                    nn.ReLU(),
-                )
+                ms = []
+                if not no_extra_linear:
+                    ms.append(nn.Linear(head_dim, head_dim))
+                ms.append(get_non_linear())
+                phi = nn.Sequential(*ms)
                 self.phi_q = phi
                 self.phi_k = phi
+            if init_to_sim:
+                if non_linear == 'elu_plus':
+                    # we will initialize weight and bias so that it is small enough,
+                    # which means at the very beginning, we expect teh attention matrix
+                    # is uniformly distributed so that all tokens can attend to all
+                    # tokens
+                    for m in [self.phi_q, self.phi_k]:
+                        m[0].weight.data *= 0.01
+                        m[0].bias.data.zero_()
+                elif non_linear is None:
+                    # relu
+                    for m in [self.phi_q, self.phi_k]:
+                        m[0].weight.data *= 0.01
+                        m[0].bias.data.one_()
         else:
             assert NotImplementedError
         self.attn_drop = nn.Dropout(attn_drop)
@@ -250,15 +380,53 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+class TorchSelfMultiHeadAttention(nn.MultiheadAttention):
+    def forward(self, x, attention_mask=None):
+        y, _ = super().forward(x, x, x, attn_mask=attention_mask)
+        return y
 
 class Block(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm,
+                 group_size=None, attention_type=None, **kwargs):
         super().__init__()
         self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        if group_size is None:
+            if attention_type is None:
+                attn = Attention(
+                    dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    attn_drop=attn_drop, proj_drop=drop,
+                )
+            elif attention_type == 'torch_attn':
+                assert qk_scale is None
+                assert drop == 0, 'not supported'
+                attn = TorchSelfMultiHeadAttention(
+                    dim, num_heads=num_heads, bias=qkv_bias,
+                    dropout=attn_drop
+                )
+            else:
+                assert self.attention_type == 'ip'
+                attn = IPAttention(
+                    dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    attn_drop=attn_drop, proj_drop=drop,
+                    qk_norm=kwargs.get('qk_norm'),
+                    non_linear=kwargs.get('non_linear'),
+                    init_to_sim=kwargs.get('init_to_sim'),
+                    no_extra_linear=kwargs.get('no_extra_linear'),
+                    elu_plus_n=kwargs.get('elu_plus_n'),
+                )
+        else:
+            attn = HAttention(
+                dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                attn_drop=attn_drop, proj_drop=drop,
+                group_size=group_size,
+            )
+        if kwargs.get('checkpoint_attn'):
+            from fairscale.nn.checkpoint import checkpoint_wrapper
+            self.attn = checkpoint_wrapper(attn)
+        else:
+            self.attn = attn
         # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -274,7 +442,8 @@ class Block(nn.Module):
 class PatchEmbed(nn.Module):
     """ Image to Patch Embedding
     """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768,
+                 group_size=None):
         super().__init__()
         img_size = to_2tuple(img_size)
         patch_size = to_2tuple(patch_size)
@@ -287,12 +456,19 @@ class PatchEmbed(nn.Module):
 
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
+        self.group_size = group_size
+
     def forward(self, x):
         B, C, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = x.to(self.proj.weight.dtype)
+        if self.group_size is None:
+            x = self.proj(x).flatten(2).transpose(1, 2)
+        else:
+            x = self.proj(x)
+            B, C, H, W = x.shape
+            x = x.reshape((B, C, H // self.group_size, self.group_size, H // self.group_size, self.group_size))
+            x = x.permute((0, 1, 2, 4, 3, 5))
+            x = x.reshape((B, C, -1)).transpose(1, 2)
         return x
 
 class HybridEmbed(nn.Module):
@@ -335,25 +511,6 @@ class HybridEmbed(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
 
-class TokenSample(nn.Module):
-    def __init__(self, num, method=None):
-        super().__init__()
-        self.num = num
-        self.method = method
-
-    def forward(self, x):
-        B, N = x.shape[:2]
-        if N <= self.num:
-            return x
-        if self.method is None:
-            # by default, we always include the first one, which is [CLS] token
-            zero = torch.zeros((1,), dtype=torch.int64)
-            ys = [x[b][torch.cat((zero, torch.randperm(N - 1)[:(self.num-1)] + 1))] for b in range(B)]
-            x = torch.stack(ys)
-        else:
-            raise NotImplementedError
-        return x
-
 class VisionTransformer(nn.Module):
     """ Vision Transformer
 
@@ -387,14 +544,21 @@ class VisionTransformer(nn.Module):
         self.output_grid = kwargs.get('output_grid', False)
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
-        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        ln_eps = kwargs.get('ln_eps', 1e-6)
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=ln_eps)
+        pre_ln = kwargs.get('pre_ln')
+
+        checkpoint_attn = kwargs.get('checkpoint_attn', 0)
 
         if hybrid_backbone is not None:
             self.patch_embed = HybridEmbed(
                 hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
         else:
             self.patch_embed = PatchEmbed(
-                img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+                img_size=img_size, patch_size=patch_size, in_chans=in_chans,
+                embed_dim=embed_dim,
+                group_size=kwargs.get('group_size')
+            )
         num_patches = self.patch_embed.num_patches
 
         self.patch_dim = img_size // patch_size
@@ -402,11 +566,36 @@ class VisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
+        if pre_ln:
+            # in CLIP model, there is such pre layer norm
+            self.pre_ln = norm_layer(embed_dim)
+        else:
+            self.pre_ln = None
+
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
+        block_kwargs = {}
+        block_keys = [
+            'group_size', 'attention_type',
+            'qk_norm', 'non_linear',
+            'init_to_sim', 'no_extra_linear',
+            'elu_plus_n',
+        ]
+        for k in block_keys:
+            if k in kwargs:
+                block_kwargs[k] = kwargs[k]
+
+        checkpoint_attns = [False for i in range(depth)]
+        for i in range(checkpoint_attn):
+            checkpoint_attns[i] = True
+
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i],
+                norm_layer=norm_layer,
+                checkpoint_attn=checkpoint_attns[i],
+                **block_kwargs,
+            )
             for i in range(depth)])
         self.norm = norm_layer(embed_dim)
 
@@ -424,7 +613,6 @@ class VisionTransformer(nn.Module):
         self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
         self.sample_token = kwargs.get('sample_token')
         self.sample_style = kwargs.get('sample_style')
-        assert self.sample_style in [None, 'vilt']
         if self.sample_token is not None:
             from qd.layers.token_sample import TokenSample
             self.sample_module = TokenSample(self.sample_token)
@@ -570,6 +758,9 @@ class VisionTransformer(nn.Module):
         x = x + pos_embed
         x = self.pos_drop(x)
 
+        if self.pre_ln:
+            x = self.pre_ln(x)
+
         # released code sets it as False; we will also not add it
         #if self.add_norm_before_transformer:
             #x = self.pre_norm(x)
@@ -581,7 +772,9 @@ class VisionTransformer(nn.Module):
         else:
             return x, x_mask, (patch_index, (H, W)), None
 
-    def rect_patch_embed(self, x):
+    # before 9/7, there is no input parameter of max_image_len and ignore_cls.
+    # We will crash it and please refactor it
+    def rect_patch_embed(self, x, max_image_len, ignore_cls=False):
         B = x.shape[0]
         H, W = x.shape[2:]
         x = self.patch_embed(x)
@@ -591,20 +784,27 @@ class VisionTransformer(nn.Module):
             new_size = (H // self.patch_embed.patch_size[0], W // self.patch_embed.patch_size[1])
             pos_embed = torch.nn.functional.interpolate(pos_embed.permute((2, 0, 1)).unsqueeze(0), size=new_size, mode='bicubic')
             pos_embed = pos_embed.squeeze(0).permute((1, 2, 0)).reshape((-1, self.embed_dim))
-            pos_embed = torch.cat((self.pos_embed[0, 0:1, :], pos_embed), dim=0).unsqueeze(0)
+            if not ignore_cls:
+                pos_embed = torch.cat((self.pos_embed[0, 0:1, :], pos_embed), dim=0).unsqueeze(0)
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
-        x = torch.cat((cls_tokens, x), dim=1)
+        if not ignore_cls:
+            cls_tokens = self.cls_token.expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+            x = torch.cat((cls_tokens, x), dim=1)
         x = x + pos_embed
-        if self.sample_token is not None:
-            assert self.training
-            x = self.sample_module(x)
+        #if self.sample_token is not None:
+            #assert self.training
+            #x = self.sample_module(x)
+        from qd.torch_common import sample_token
+        x = sample_token(x, max_image_len)
         x = self.pos_drop(x)
+
+        if self.pre_ln:
+            x = self.pre_ln(x)
         return x
 
     def forward_features(self, x):
-        if self.sample_style is None:
-            x = self.rect_patch_embed(x)
+        if self.sample_style in [None, 'rect']:
+            x = self.rect_patch_embed(x, self.sample_token)
         else:
             assert self.sample_style == 'vilt'
             x, x_mask, patch_index, label = self.visual_embed(
@@ -795,6 +995,13 @@ def vit_base_patch32_384(pretrained=False, **kwargs):
     model = _create_vision_transformer('vit_base_patch32_384', pretrained=pretrained, **model_kwargs)
     return model
 
+@register_model
+def vit_huge_patch32_384(pretrained=False, **kwargs):
+    model_kwargs = dict(patch_size=32, embed_dim=1280, depth=32, num_heads=16, **kwargs)
+    assert not pretrained
+    model = _create_vision_transformer('vit_huge_patch32_384', pretrained=pretrained, **model_kwargs)
+    return model
+
 
 @register_model
 def vit_large_patch16_224(pretrained=False, **kwargs):
@@ -904,6 +1111,28 @@ def vit_base_resnet50_224_in21k(pretrained=False, **kwargs):
         embed_dim=768, depth=12, num_heads=12, hybrid_backbone=backbone,
         representation_size=768, **kwargs)
     model = _create_vision_transformer('vit_base_resnet50_224_in21k', pretrained=pretrained, **model_kwargs)
+    return model
+
+@register_model
+def vit_base_conv5s2_patch32_384(pretrained=False, **kwargs):
+    def block(input_feat, out_feature, kernel_size, stride):
+        return nn.Sequential(
+            StdConv2dSame(input_feat, out_feature, kernel_size=kernel_size, stride=stride),
+            nn.GroupNorm(num_groups=32, num_channels=out_feature),
+            nn.ReLU(),
+        )
+    backbone = nn.Sequential(
+        block(input_feat=3, out_feature=64, kernel_size=3, stride=2),
+        block(input_feat=64, out_feature=128, kernel_size=3, stride=2),
+        block(input_feat=128, out_feature=256, kernel_size=3, stride=2),
+        block(input_feat=256, out_feature=512, kernel_size=3, stride=2),
+        block(input_feat=512, out_feature=1024, kernel_size=3, stride=2),
+        # no need to map it as it will be done in VisionTransformer
+        #nn.Linear(1024, 768),
+    )
+    model_kwargs = dict(
+        embed_dim=768, depth=12, num_heads=12, hybrid_backbone=backbone, **kwargs)
+    model = _create_vision_transformer('vit_base_conv5s2_patch32_384', pretrained=pretrained, **model_kwargs)
     return model
 
 
